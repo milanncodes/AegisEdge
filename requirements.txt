@@ -1,0 +1,5 @@
+torch
+numpy
+librosa
+cryptography
+qai-hub
