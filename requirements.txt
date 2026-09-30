@@ -1,5 +1,11 @@
-torch
-numpy
-librosa
+numpy<2.0.0
+scipy
+onnxruntime
 cryptography
+rich
+typer
+sounddevice
+
+# Development-only Qualcomm AI Hub tooling
 qai-hub
+rich

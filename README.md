@@ -1,48 +1,85 @@
-# AegisEdge: Real-time, On-device Threat Detection for Snapdragon Platforms
+# AegisEdge — Zero-Cloud Tactical Edge Acoustic Surveillance on Snapdragon X Hexagon NPU
 
-## Project Overview & Problem Statement
+AegisEdge is an on-device acoustic threat detection reference implementation for Snapdragon-class Windows on ARM64 systems. It turns raw PCM into a compact log-mel spectrogram, runs a quantized ONNX classifier through Qualcomm's QNN HTP execution provider when available, scores contextual risk locally, and relays only encrypted telemetry over a local mesh.
 
-**AegisEdge** addresses the critical limitations of traditional emergency alert systems: the **"intentional action barrier"** and **"cloud dispatch latency."** Manual SOS buttons often fail during sudden, overwhelming threats, while cloud-based processing introduces unacceptable delays (15-30 minutes) for life-threatening events.
+## Problem & Why On-Device Snapdragon
 
-Our solution leverages **Edge AI on Qualcomm Snapdragon SoCs** to provide continuous, zero-latency, autonomous local threat assessment and micro-acoustic distress detection directly on-device. This eliminates the need for manual intervention and cloud reliance, enabling instantaneous, localized response initiation.
+Cloud acoustic monitoring is unavailable exactly when connectivity is disrupted, and its round trip adds latency to mission-critical alerts. AegisEdge keeps detection, risk scoring, and first-hop relay local so it can continue operating without internet access.
 
-## Tiered Snapdragon Hardware Execution Architecture
+The Hexagon NPU is designed for efficient always-on inference. The project target is less than 2 W for the NPU path versus an illustrative 18 W CPU/dGPU background-listening budget on HP Omnibook-class PCs; these are system-design targets, not measurements from this repository. Local AES-GCM-256 encryption protects threat telemetry before it reaches a neighboring node.
 
-AegisEdge utilizes a highly optimized, tiered execution model across the Snapdragon SoC for ultra-low power consumption and rapid escalation upon threat detection:
+## System Architecture
 
-*   **Level 1 (Baseline / Safe): Monitored by Qualcomm Sensing Hub (uDSP)**
-    *   Ultra-low power (<1mW) context gathering (BLE, IMU, Geofencing) for initial anomaly detection.
+```mermaid
+flowchart LR
+    A[Raw PCM audio stream] --> B[NumPy/SciPy DSP\nHann FFT + 64-bin log-mel]
+    B --> C[ONNX Runtime]
+    C --> D{QNN HTP provider\nQnnHtp.dll / burst}
+    C --> E[CPUExecutionProvider\ngraceful fallback]
+    D --> F[Acoustic event\ncategory + confidence + latency]
+    E --> F
+    F --> G[Risk Engine\ncontext + isolation + motion]
+    G --> H[AES-GCM-256\ntrusted mesh beacon]
+    H --> I[UDP multicast\nstore-and-forward peers]
+```
 
-*   **Level 2 (Guarded / Active Watch): LPASS + Hardware VAD active**
-    *   Low-Power Audio Subsystem (LPASS) and Hardware Voice Activity Detection (VAD) for proactive acoustic monitoring.
+## Repository Layout
 
-*   **Level 3 (Warning / Escalation): Hexagon NPU burst compute triggered via hardware interrupt**
-    *   Instantaneous Hexagon NPU burst compute for INT8 acoustic inference (4.2ms). Silent haptic countdown for user cancellation.
-
-*   **Level 4 (Critical / Dispatch): Full SoC wakeup**
-    *   TrustZone-secured AES-256 black-box data encryption. FastConnect-enabled P2P BLE mesh broadcast of encrypted distress signals to nearby devices, creating an ad-hoc emergency network.
+- `main.py`: Rich console commands and end-to-end demonstration.
+- `src/acoustic_monitor.py`: streaming PCM buffer, pure NumPy/SciPy log-mel features, QNN-first ONNX inference.
+- `src/risk_engine.py`: contextual threat scoring and level transitions.
+- `src/mesh_beacon.py`: AES-GCM-256 encrypted UDP multicast and in-memory offline queue.
+- `src/snapdragon_profiler.py`: QNN/CPU verification, p50/p95 latency, and throughput measurements.
+- `docs/AEGISEDGE_SPEC.md`: system design and threat matrix.
 
 ## Quickstart
 
-To run the AegisEdge simulation locally:
+Use Python 3.10+ in a virtual environment. On Windows ARM64, install an ONNX Runtime build that exposes the QNN execution provider and place the required QNN runtime libraries, including `QnnHtp.dll`, on the DLL search path.
 
-1.  Install dependencies:
-    ```bash
-    pip install -r requirements.txt
-    ```
-2.  Execute the main simulation script:
-    ```bash
-    python main.py
-    ```
+```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
-## Qualcomm AI Hub HTP Benchmarking Results
+Point the application at a quantized static-shape acoustic model:
 
-Through rigorous profiling with the Qualcomm AI Hub SDK, the AegisEdge acoustic classification model achieves exceptional performance on target Snapdragon hardware:
+```bash
+set AEGSEDGE_ACOUSTIC_MODEL=models\acoustic_event_classifier_int8.onnx
+# PowerShell: $env:AEGSEDGE_ACOUSTIC_MODEL = "models\acoustic_event_classifier_int8.onnx"
+```
 
-*   **Target Device:** Samsung Galaxy S24 (Snapdragon 8 Gen 3, Hexagon HTP 7.x)
-*   **Inference Latency:** ~4.2ms (Burst Mode)
-*   **End-to-End Budget:** <30ms (PASSED)
-*   **Power Consumption:** <25mW peak during burst compute
-*   **Quantization:** Post-Training Quantization (PTQ) to INT8 for maximum NPU efficiency.
+The expected model input is `(1, 1, 64, 188)` float32 log-mel data. The application automatically falls back to `CPUExecutionProvider` if the model, QNN provider, or HTP driver is unavailable.
 
-This validates AegisEdge's ability to provide sub-30ms threat detection on cutting-edge mobile platforms.
+## Judge Verification
+
+Run the deterministic synthetic demonstration:
+
+```bash
+python main.py simulate
+```
+
+This injects broken-glass, siren, and distress-call fixtures and displays the pipeline as `Audio Spectrogram -> Hexagon NPU/CPU -> Risk Engine -> Encrypted Mesh Broadcast`. Critical events are encrypted and decoded by a trusted local listener; no internet service is required.
+
+Run the live Rich dashboard:
+
+```bash
+python main.py live
+```
+
+The live view shows acoustic listening state, threat level, active provider, latency, recent event log, mesh peers, and queued alerts. The current default stream is a mock PCM fallback; a device-specific `sounddevice` capture adapter can replace it without changing the classifier API.
+
+Compare providers and inspect rolling telemetry:
+
+```bash
+python main.py benchmark
+```
+
+The benchmark prints whether `QNNExecutionProvider` was verified, the configured `QnnHtp.dll` backend, p50/p95 inference latency, and inferences per second for QNN and CPU. Missing model or hardware support is reported as a fallback note instead of stopping the demonstration.
+
+## Development Notes
+
+- Raw audio is processed in volatile memory and is not persisted by the application.
+- Mesh payloads use a shared 32-byte AES-GCM key; production deployments should provision that key through the platform's secure storage rather than generating it at process startup.
+- `qai-hub` is included for development-time compilation and profiling workflows, not required for the local simulator.

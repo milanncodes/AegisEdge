@@ -1,61 +1,83 @@
-import torch
-import qai_hub as hub
-from acoustic_monitor import MicroAcousticClassifier
+"""QNN/CPU acoustic inference telemetry and optional AI Hub submission."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
 import os
+import time
+from typing import Iterable
 
-def profile_acoustic_model():
-    print("--- AegisEdge: Snapdragon AI Hub Profiling Pipeline ---")
+import numpy as np
 
-    # 1. Model Preparation
-    model = MicroAcousticClassifier()
-    model.eval()
+try:
+    from .acoustic_monitor import AcousticPipeline, BUFFER_SIZE, STATIC_INPUT_SHAPE
+except ImportError:  # Support direct execution from the src directory.
+    from acoustic_monitor import AcousticPipeline, BUFFER_SIZE, STATIC_INPUT_SHAPE
 
-    # Static shape as per AEGISEDGE_SPEC.md
-    input_shape = (1, 1, 64, 188)
-    dummy_input = torch.randn(input_shape)
 
-    print(f"[STEP 1] Initializing model with static input shape: {input_shape}")
+QNN_BACKEND_PATH = "QnnHtp.dll"
+QNN_PERFORMANCE_MODE = "burst"
 
-    # 2. Attempt AI Hub Submission
-    try:
-        # Check for API Token in environment
-        if not os.environ.get("QAI_HUB_API_TOKEN"):
-            raise ConnectionError("QAI_HUB_API_TOKEN not found. Entering Simulation Mode.")
 
-        client = hub.Client()
-        device = hub.Device("Samsung Galaxy S24 (Family)")
+@dataclass(frozen=True)
+class BenchmarkResult:
+    provider: str
+    qnn_available: bool
+    htp_backend: str
+    samples: int
+    p50_latency_ms: float
+    p95_latency_ms: float
+    inferences_per_second: float
+    note: str = ""
 
-        print(f"[STEP 2] Submitting to Qualcomm AI Hub (Target: {device.name})...")
 
-        # Compile for Hexagon NPU (QNN Context Binary)
-        compile_job = hub.submit_compile_job(
-            model=model,
-            input_specs=dict(audio_spectrogram=input_shape),
-            device=device,
-            options="--target_runtime qnn_context_binary"
+def _percentile(values: Iterable[float], percentile: float) -> float:
+    values = np.asarray(list(values), dtype=np.float64)
+    return float(np.percentile(values, percentile)) if values.size else 0.0
+
+
+def benchmark_provider(model_path: str, provider: str, iterations: int = 20) -> BenchmarkResult:
+    """Measure rolling inference latency and throughput for one provider."""
+    pipeline = AcousticPipeline(model_path=model_path, preferred_provider=provider)
+    audio = np.zeros(BUFFER_SIZE, dtype=np.float32)
+    latencies = []
+    started = time.perf_counter()
+    for _ in range(iterations):
+        event = pipeline.process_live_buffer(audio)
+        if event.inference_latency_ms > 0:
+            latencies.append(event.inference_latency_ms)
+    elapsed = time.perf_counter() - started
+    qnn_available = pipeline.execution_provider == "QNNExecutionProvider"
+    return BenchmarkResult(
+        provider=pipeline.execution_provider,
+        qnn_available=qnn_available,
+        htp_backend=QNN_BACKEND_PATH if qnn_available else "n/a",
+        samples=len(latencies),
+        p50_latency_ms=_percentile(latencies, 50),
+        p95_latency_ms=_percentile(latencies, 95),
+        inferences_per_second=len(latencies) / elapsed if elapsed else 0.0,
+        note=pipeline.provider_error or "provider active",
+    )
+
+
+def profile_acoustic_model(iterations: int = 20) -> tuple[BenchmarkResult, BenchmarkResult]:
+    model_path = os.environ.get("AEGSEDGE_ACOUSTIC_MODEL", "models/acoustic_event_classifier_int8.onnx")
+    print("--- AegisEdge Snapdragon acoustic telemetry ---")
+    print(f"Model: {model_path}")
+    print(f"Input: {STATIC_INPUT_SHAPE} | QNN backend: {QNN_BACKEND_PATH} | mode: {QNN_PERFORMANCE_MODE}")
+    qnn = benchmark_provider(model_path, "QNNExecutionProvider", iterations)
+    cpu = benchmark_provider(model_path, "CPUExecutionProvider", iterations)
+    print(f"QNN provider verified: {qnn.qnn_available} ({qnn.provider})")
+    for result in (qnn, cpu):
+        print(
+            f"{result.provider}: p50={result.p50_latency_ms:.2f} ms, "
+            f"p95={result.p95_latency_ms:.2f} ms, "
+            f"inferences/s={result.inferences_per_second:.2f}"
         )
+        if result.note:
+            print(f"  note: {result.note}")
+    return qnn, cpu
 
-        profile_job = hub.submit_profile_job(
-            model=compile_job.get_target_model(),
-            device=device
-        )
 
-        print(f"[LIVE] Job Submitted. Compile ID: {compile_job.job_id} | Profile ID: {profile_job.job_id}")
-
-    except Exception as e:
-        # 3. Simulation Mode (Fallback)
-        print(f"[WARNING] {e}")
-        print("\n--- SIMULATION MODE: Qualcomm HTP Validation ---")
-        print("[ARCH] Target: Snapdragon 8 Gen 3 (Hexagon HTP 7.x)")
-        print("[COMP] Options: --target_runtime qnn_context_binary")
-        print("[COMP] Quantization: Post-Training Quantization (PTQ) to INT8")
-        print("[COMP] Memory: Static allocation of 188ms context buffer in NPU L2 Cache")
-        print("\n[PROF] Expected Performance Metrics:")
-        print("  - Inference Latency: 4.2ms (Burst Mode)")
-        print("  - End-to-End Budget: <30ms (PASSED)")
-        print("  - Power: <25mW peak during burst compute")
-        print("  - Memory Bandwidth: 1.8 GB/s utilization")
-        print("\n[AUTH] Hardware constraints validated for production build.")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     profile_acoustic_model()

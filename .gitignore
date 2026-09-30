@@ -1,0 +1,27 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.build/
+dist/
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Local audio captures
+*.wav
+*.mp3
+*.pcm
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Local tooling and secrets
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
